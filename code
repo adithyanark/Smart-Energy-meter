@@ -1,0 +1,231 @@
+#define BLYNK_TEMPLATE_ID "TMPL3ANpzg5kz"
+#define BLYNK_TEMPLATE_NAME "energy"
+#define BLYNK_PRINT Serial
+ 
+#include "EmonLib.h"
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Pin for the switch
+const int switchPin = 2;
+ 
+// Constants for calibration
+const float vCalibration = 45.5;
+const float currCalibration = 0.12;
+ 
+// Blynk and WiFi credentials
+const char auth[] = "vlzsWGFKLVG6-j8vGWTo8BNVXeUYeXtz";
+const char ssid[] = "Abcd";
+const char pass[] = "12345678";
+ 
+// EnergyMonitor instance
+EnergyMonitor emon;
+ 
+// Timer for regular updates
+BlynkTimer timer;
+ 
+// Variables for energy calculation
+float kWh = 0.0;
+float bill = 0.0; // Variable for storing the calculated bill
+float targetBill = 0.0; // Variable for storing the target bill
+unsigned long lastMillis = millis();
+ 
+// EEPROM addresses for each variable
+const int addrVrms = 0;
+const int addrIrms = 4;
+const int addrPower = 8;
+const int addrKWh = 12;
+const int addrBill = 16; // Address for storing the bill
+const int addrTargetBill = 20; // Address for storing the target bill
+ 
+// Function prototypes
+void sendEnergyDataToBlynk();
+void readEnergyDataFromEEPROM();
+void saveEnergyDataToEEPROM();
+BLYNK_WRITE(V4); // This function will be called every time we write to virtual pin V4
+ 
+void setup()
+{
+  Serial.begin(115200);
+  Blynk.begin(auth, ssid, pass);
+ 
+  // Initialize the LCD
+  lcd.init();
+  lcd.backlight();
+ 
+  // Initialize EEPROM with the size of the data to be stored
+  EEPROM.begin(32); // Allocate 32 bytes for float values (4 bytes each) and some extra space
+ 
+  // Read the stored energy data from EEPROM
+  readEnergyDataFromEEPROM();
+ 
+  // Setup voltage and current inputs
+  emon.voltage(35, vCalibration, 1.7); // Voltage: input pin, calibration, phase_shift
+  emon.current(34, currCalibration);    // Current: input pin, calibration
+ 
+  // Setup a timer for sending data every 5 seconds
+  timer.setInterval(5000L, sendEnergyDataToBlynk);
+ 
+  // Set the switch pin as output and set it to HIGH
+  pinMode(switchPin, OUTPUT);
+  digitalWrite(switchPin, HIGH);
+  
+  // Sync the state of the switch with Blynk
+  Blynk.syncVirtual(V1);
+ 
+  // A small delay for system to stabilize
+  delay(100);
+}
+ 
+ 
+void loop()
+{
+  Blynk.run();
+  timer.run();
+}
+ 
+ 
+void sendEnergyDataToBlynk()
+{
+  emon.calcVI(20, 2000); // Calculate all. No.of half wavelengths (crossings), time-out
+
+  // Check if the voltage is less than 220V and current is less than 0.5A
+  if (emon.Vrms < 220) {
+    emon.Vrms = 0;
+  }
+  if (emon.Irms < 0.5) {
+    emon.Irms = 0;
+  }
+
+  // Alert if the voltage is above 250V
+  if (emon.Vrms > 250) {
+    Serial.println("Alert! Voltage is above 250V.");
+    Blynk.logEvent("high_voltage");
+    digitalWrite(switchPin, LOW);
+  }else
+  {
+    digitalWrite(switchPin, HIGH);
+    Serial.println(" Voltage is comes to normal.");
+  }
+
+  // Calculate apparent power with possibly modified Vrms and Irms
+  float apparentPower = emon.Vrms * emon.Irms;
+
+  // Calculate energy consumed in kWh
+  unsigned long currentMillis = millis();
+  kWh += apparentPower * (currentMillis - lastMillis) / 3600000000.0;
+  lastMillis = currentMillis;
+
+  // Calculate the electricity bill
+  if (kWh <= 50) {
+    bill = 40 + kWh * 3.25;
+  } else if (kWh <= 100) {
+    bill = 65 + kWh * 4.05;
+  } else if (kWh <= 150) {
+    bill = 85 + kWh * 5.10;
+  } else if (kWh <= 200) {
+    bill = 120 + kWh * 6.95;
+  } else if (kWh <= 250) {
+    bill = 130 + kWh * 8.20;
+  } else if (kWh <= 300) {
+    bill = 150 + kWh * 6.40;
+  } else if (kWh <= 350) {
+    bill = 175 + kWh * 7.25;
+  } else if (kWh <= 400) {
+    bill = 200 + kWh * 7.60;
+  } else if (kWh <= 500) {
+    bill = 230 + kWh * 7.90;
+  } else if (kWh >= 800) {
+    bill = 260 + kWh * 8.80;
+  }
+
+  // Check if the bill has reached 25%, 50% or 100% of the target bill and trigger an event
+  if (bill >= targetBill * 0.25 && bill < targetBill * 0.5) {
+    // Trigger event for 25% of target bill
+    Serial.println("Bill has reached 25% of the target bill.");
+    Blynk.logEvent("electricity_bill_warning_25");
+  } else if (bill >= targetBill * 0.5 && bill < targetBill) {
+    // Trigger event for 50% of target bill
+    Serial.println("Bill has reached 50% of the target bill.");
+    Blynk.logEvent("electricity_bill_warning_50");
+  } else if (bill >= targetBill) {
+    // Trigger event for 100% of target bill
+    Serial.println("Bill has reached 100% of the target bill.");
+    Blynk.logEvent("electricity_bill_warning_100");
+
+  }
+
+  // Print data to Serial for debugging
+  Serial.printf("Vrms: %.2fV\tIrms: %.4fA\tPower: %.4fW\tkWh: %.5fkWh\tBill: %.2f\n",
+                emon.Vrms, emon.Irms, apparentPower, kWh, bill);
+
+  // Save the latest values to EEPROM
+  saveEnergyDataToEEPROM();
+
+  // Send data to Blynk
+  Blynk.virtualWrite(V0, emon.Vrms);
+  Blynk.virtualWrite(V2, apparentPower);
+  Blynk.virtualWrite(V3, bill); // Send the calculated bill to Blynk
+
+  // Update the LCD with the new values
+  lcd.setCursor(0, 4);
+  lcd.print("Bill: ");
+  lcd.print(bill, 2);
+  lcd.print(" INR");
+}
+
+BLYNK_WRITE(V1)
+{
+  int pinValue = param.asInt(); // Assigning incoming value from pin V1 to a variable
+
+  // Write the value to the digital pin
+  digitalWrite(switchPin, pinValue);
+  
+  // Send feedback to Blynk app about the state of the switch
+  Blynk.virtualWrite(V1, pinValue);
+}
+
+BLYNK_WRITE(V4)
+{
+  targetBill = param.asFloat(); // Assigning incoming value from pin V4 to the target bill variable
+}
+ 
+ 
+void readEnergyDataFromEEPROM()
+{
+  // Read the stored kWh, bill and target bill values from EEPROM
+  EEPROM.get(addrKWh, kWh);
+  EEPROM.get(addrBill, bill);
+  EEPROM.get(addrTargetBill, targetBill);
+
+  // Check if the read values are valid floats. If not, initialize them to zero
+  if (isnan(kWh)) {
+    kWh = 0.0;
+  }
+  if (isnan(bill)) {
+    bill = 0.0;
+  }
+  if (isnan(targetBill)) {
+    targetBill = 0.0;
+  }
+
+  // Save initialized values to EEPROM
+  saveEnergyDataToEEPROM();
+}
+ 
+ 
+void saveEnergyDataToEEPROM()
+{
+  // Write the current kWh, bill and target bill values to EEPROM
+  EEPROM.put(addrKWh, kWh);
+  EEPROM.put(addrBill, bill);
+  EEPROM.put(addrTargetBill, targetBill);
+
+  // Commit changes to EEPROM
+  EEPROM.commit();
+}
